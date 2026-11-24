@@ -10,6 +10,8 @@ Boot that kernel and you get a black screen, a fallback resolution, or no CUDA.
 and it only moves the **kernel and the NVIDIA driver together**, once openSUSE has
 published a driver built for that exact kernel.
 
+📖 **Full explanation with diagrams:** [Tumbleweed + NVIDIA: Update the Kernel and Driver Together, Safely](https://mfaruk.com/blog/opensuse-tumbleweed-nvidia-safe-kernel-driver-update)
+
 ```
 update-everything --check   # show what would change, change nothing
 update-everything           # update everything safely
