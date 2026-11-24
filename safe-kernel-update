@@ -1,0 +1,114 @@
+#!/bin/bash
+# safe-kernel-update — openSUSE Tumbleweed: kernel + NVIDIA driver move together, or not at all.
+#  * kernel-default + NVIDIA signed open kernel module (KMP) ONLY from the official openSUSE OSS/update repos
+#  * the KMP must be built for that exact kernel (its version contains _k<kernel>_<release>)
+#  * NVIDIA userspace (gl/compute/video/...) moves to the SAME driver version as the KMP, or nothing happens
+#  * snapper pre/post snapshot, dry run first, locks always restored, module + version + boot entry verified
+# Supports: nvidia-open-driver-G06/G07-signed-kmp-default, systemd-boot / grub2-bls (sdbootutil) and GRUB 2.
+# Usage: sudo safe-kernel-update [--check] [--no-refresh]
+# Exit:  0 up to date | 10 waiting (matching driver not published yet) | 20 updated, reboot needed
+#        30 --check: ready to update | 1 failed
+# Rollback if the new kernel misbehaves: sudo snapper rollback <PRE number printed below>, reboot.
+set -uo pipefail
+export LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+CHECK=0; REFRESH=1
+for a in "$@"; do case $a in --check) CHECK=1;; --no-refresh) REFRESH=0;; *) echo "unknown option $a"; exit 1;; esac; done
+fail(){ echo; echo "FAILED: $*"; exit 1; }
+
+# ---- detect driver branch (override: DRV=G06 safe-kernel-update)
+DRV=${DRV:-$(rpm -qa --qf '%{NAME}\n' 'nvidia-open-driver-G0*-signed-kmp-default' | sed -E 's/^nvidia-open-driver-(G0[0-9])-.*/\1/' | sort -V | tail -1)}
+[ -n "$DRV" ] || fail "no openSUSE signed NVIDIA driver installed (nvidia-open-driver-G06/G07-signed-kmp-default). See README."
+KMPN=nvidia-open-driver-${DRV}-signed-kmp-default
+rpm -q "$KMPN" >/dev/null || fail "$KMPN is not installed."
+LOCKS=('kernel-default*' 'nvidia-*' 'kernel-firmware-nvidia*')
+for x in kernel-devel kernel-source kernel-macros kernel-syms; do rpm -q "$x" >/dev/null 2>&1 && LOCKS+=("$x"); done
+LOADER=$(. /etc/sysconfig/bootloader 2>/dev/null; echo "${LOADER_TYPE:-grub2}")
+
+# ---- official openSUSE OSS + update repos (not debug/source, not NVIDIA/Packman/third party)
+OSS=$(zypper -q lr -E -u | awk -F'|' 'NR>2{gsub(/ /,"",$2);gsub(/ /,"",$7);
+  if($7 ~ /opensuse\.org\/(tumbleweed\/repo\/oss|update\/tumbleweed)\/?$/) printf "-r %s ",$2}')
+[ -n "$OSS" ] || fail "no official openSUSE Tumbleweed OSS repo is enabled."
+# vers <package> [repo args] -> available version-release strings, oldest first
+vers(){ zypper -q --no-refresh se -s --match-exact -t package $2 "$1" 2>/dev/null | awk -F'|' 'NR>2{gsub(/ /,"",$4);print $4}' | sort -uV; }
+hasmod(){ compgen -G "/lib/modules/$1-default/*updates/nvidia.ko*" >/dev/null; }
+
+[ $REFRESH = 0 ] || zypper -q ref >/dev/null || fail "zypper refresh failed (network or repo problem)."
+KVER=$(vers kernel-default "$OSS" | tail -1)            # e.g. 7.3.5-1.1
+[ -n "$KVER" ] || fail "could not read kernel versions from the openSUSE repo."
+KREL=${KVER%.*}                                         # 7.3.5-1
+KMP=$(vers "$KMPN" "$OSS" | grep -F "_k${KREL//-/_}-" | tail -1)
+CURKMP=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$KMPN")
+DRVOLD=${CURKMP%%_k*}
+echo "Driver $DRV | running kernel $(uname -r) | installed NVIDIA $CURKMP"
+echo "openSUSE newest: kernel $KVER, NVIDIA $DRV for it: ${KMP:-NONE}"
+
+if [ -z "$KMP" ]; then
+  echo "WAITING: kernel $KVER is out, but openSUSE has no $DRV NVIDIA driver for it yet. Nothing changed."; exit 10
+fi
+if [ "$KMP" = "$CURKMP" ] && rpm -q "kernel-default-$KVER" >/dev/null; then
+  hasmod "$KREL" || fail "kernel $KREL is installed but has NO NVIDIA module. Do NOT boot it."
+  echo "UP TO DATE: kernel $KVER + NVIDIA $KMP. Nothing to do."; exit 0
+fi
+DRVNEW=${KMP%%_k*}
+
+# ---- exact package list
+PKGS=()
+if ! rpm -q "kernel-default-$KVER" >/dev/null; then
+  PKGS+=("kernel-default-$KVER")
+  # kernel sub-packages / devel packages that must match the kernel version
+  mapfile -t KSUB < <({ rpm -qa --qf '%{NAME}\n' 'kernel-default-*'; for x in kernel-devel kernel-source kernel-macros kernel-syms; do rpm -q --qf '%{NAME}\n' "$x" 2>/dev/null; done; } | grep -v 'not installed' | sort -u)
+  for p in "${KSUB[@]}"; do
+    vers "$p" "$OSS" | grep -qxF "$KVER" || { echo "WAITING: $p $KVER is not published yet. Nothing changed."; exit 10; }
+    PKGS+=("$p-$KVER")
+  done
+fi
+PKGS+=("$KMPN-$KMP")
+if [ "$DRVNEW" != "$DRVOLD" ]; then
+  mapfile -t USR < <(rpm -qa --qf '%{NAME} %{VERSION}\n' 'nvidia-*' | awk -v v="$DRVOLD" -v k="$KMPN" '$2==v && $1!=k{print $1}' | sort -u)
+  for p in "${USR[@]}"; do
+    vers "$p" "" | grep -q "^${DRVNEW//./\\.}-" || {
+      echo "WAITING: NVIDIA $DRVNEW is out for kernel $KREL, but $p $DRVNEW is not published yet. Nothing changed."; exit 10; }
+    PKGS+=("$p=$DRVNEW")
+  done
+fi
+echo "Kernel $KVER + NVIDIA $KMP available together. Packages:"; printf '  %s\n' "${PKGS[@]}"
+[ $CHECK = 0 ] || { echo "READY: safe to update (check mode, nothing changed)."; exit 30; }
+
+PRE=$(snapper create -t pre -p -d "before kernel $KVER + NVIDIA $KMP") || fail "snapper pre-snapshot failed."
+echo "Snapshot (pre): $PRE"
+relock(){ zypper -q al "${LOCKS[@]}" >/dev/null && echo "Locks restored." || echo "WARNING: locks NOT restored! Run: sudo zypper al ${LOCKS[*]}"; }
+trap relock EXIT
+zypper -q rl "${LOCKS[@]}" >/dev/null || fail "could not remove locks."
+echo "--- dry run"
+DRY=$(zypper -n --no-refresh in --dry-run --auto-agree-with-licenses "${PKGS[@]}" 2>&1); rc=$?
+echo "$DRY"
+[ $rc = 0 ] || fail "dry run failed — nothing was installed."
+grep -q 'going to be REMOVED' <<<"$DRY" && fail "dry run wants to REMOVE packages — stopped, nothing was installed."
+echo "--- installing"
+zypper -n --no-refresh in --auto-agree-with-licenses "${PKGS[@]}" || fail "install failed. Roll back: sudo snapper rollback $PRE && reboot"
+rpm -q kernel-firmware-nvidia >/dev/null 2>&1 && { zypper -n --no-refresh up $OSS --auto-agree-with-licenses kernel-firmware-nvidia >/dev/null || echo "note: kernel-firmware-nvidia update skipped"; }
+snapper create -t post --pre-number "$PRE" -d "after kernel $KVER + NVIDIA $KMP" >/dev/null
+
+# ---- verify
+hasmod "$KREL" || fail "no NVIDIA module for $KREL. Do NOT reboot. Roll back: sudo snapper rollback $PRE"
+MV=$(modinfo -k "$KREL-default" -F version nvidia 2>/dev/null)
+[ "$MV" = "$DRVNEW" ] || fail "NVIDIA module for $KREL is '$MV', expected $DRVNEW. Do NOT reboot. Roll back: sudo snapper rollback $PRE"
+BAD=$(rpm -qa --qf '%{NAME} %{VERSION}\n' 'nvidia-*' | awk -v o="$DRVOLD" -v n="$DRVNEW" 'o!=n && $2==o{print $1}')
+[ -z "$BAD" ] || fail "NVIDIA userspace still on $DRVOLD: $BAD. Do NOT reboot. Roll back: sudo snapper rollback $PRE"
+case $LOADER in
+  systemd-boot|grub2-bls)
+    ent(){ bootctl list --no-pager 2>/dev/null | awk '/ id: /{print $2}' | grep -F "$KREL-default" | tail -1; }
+    ENTRY=$(ent); [ -n "$ENTRY" ] || { sdbootutil add-kernel "$KREL-default" >/dev/null 2>&1; ENTRY=$(ent); }
+    [ -n "$ENTRY" ] || fail "no boot entry for $KREL (EFI partition full?). Do NOT reboot. Roll back: sudo snapper rollback $PRE"
+    bootctl set-default "$ENTRY" || fail "could not set default boot entry $ENTRY."
+    BOOT="default boot = $ENTRY";;
+  *)
+    CFG=/boot/grub2/grub.cfg
+    grep -qF "vmlinuz-$KREL-default" "$CFG" 2>/dev/null || grub2-mkconfig -o "$CFG" >/dev/null 2>&1
+    grep -qF "vmlinuz-$KREL-default" "$CFG" 2>/dev/null || fail "GRUB menu has no entry for $KREL. Do NOT reboot. Roll back: sudo snapper rollback $PRE"
+    BOOT="GRUB menu has $KREL";;
+esac
+echo; echo "SUCCESS: kernel $KREL + NVIDIA $DRVNEW installed and verified, $BOOT. REBOOT NEEDED."
+echo "Older kernels lose their NVIDIA module. If anything is wrong after reboot: sudo snapper rollback $PRE && reboot"
+exit 20

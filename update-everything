@@ -1,0 +1,193 @@
+#!/bin/bash
+# update-everything — update a whole openSUSE Tumbleweed PC with an NVIDIA GPU, safely, in one command.
+#   update-everything           update everything
+#   update-everything --check   show what would change, change nothing
+# Steps: 0 pre-flight (locks, disk, repos)  1 OS + all apps (zypper dup, kernel/NVIDIA stay locked)
+#        2 kernel + NVIDIA together, only from official openSUSE (safe-kernel-update)
+#        3 Flatpak apps  4 firmware (report only — BIOS/SSD flashing is never automatic)  5 health check
+# First run from the cloned folder installs itself (and safe-kernel-update) to /usr/local/bin.
+# Log: /var/log/update-everything/   Project: https://github.com/mmhfarooque/tumbleweed-nvidia-update
+set -uo pipefail
+export LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+CHECK=0
+for a in "$@"; do case $a in --check) CHECK=1;; -h|--help) sed -n '2,8p' "$0"; exit 0;; *) echo "unknown option $a"; exit 1;; esac; done
+LOCKS=('kernel-default*' 'nvidia-*' 'kernel-firmware-nvidia*')
+for x in kernel-devel kernel-source kernel-macros kernel-syms; do rpm -q "$x" >/dev/null 2>&1 && LOCKS+=("$x"); done
+DRV=${DRV:-$(rpm -qa --qf '%{NAME}\n' 'nvidia-open-driver-G0*-signed-kmp-default' | sed -E 's/^nvidia-open-driver-(G0[0-9])-.*/\1/' | sort -V | tail -1)}
+LOADER=$(. /etc/sysconfig/bootloader 2>/dev/null; echo "${LOADER_TYPE:-grub2}")
+U=${SUDO_USER:-}
+SKU=/usr/local/bin/safe-kernel-update
+
+# self-install (source = folder this file is in)
+SRC=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+if [ "$SRC" != /usr/local/bin ]; then
+  for f in update-everything safe-kernel-update; do
+    [ -f "$SRC/$f" ] || { echo "FAILED: $SRC/$f missing."; exit 1; }
+    cmp -s "$SRC/$f" "/usr/local/bin/$f" || install -m 755 "$SRC/$f" "/usr/local/bin/$f" || { echo "FAILED: could not install $f"; exit 1; }
+  done
+fi
+
+mkdir -p /var/log/update-everything
+LOG=/var/log/update-everything/$(date +%F-%H%M%S)$([ $CHECK = 1 ] && echo -check).log
+exec > >(tee -a "$LOG") 2>&1
+T0=$(date +%s)
+declare -A ST NOTE; ORDER=(preflight os kernel flatpak firmware health)
+set_st(){ ST[$1]=$2; NOTE[$1]=${3:-}; }
+hdr(){ echo; echo "=== $* ==="; }
+echo "update-everything $([ $CHECK = 1 ] && echo '(CHECK ONLY)') — $(date '+%F %T') — log: $LOG"
+
+# ---------- 0 pre-flight ----------
+hdr "0. Pre-flight"
+PF=OK; PFN=""
+if [ -z "$DRV" ]; then
+  echo "No openSUSE signed NVIDIA driver found (nvidia-open-driver-G06/G07-signed-kmp-default)."
+  echo "Install it first, e.g.: sudo zypper in nvidia-open-driver-G06-signed-kmp-meta   (see README)"
+  echo; echo "FAILED: NVIDIA driver not detected — nothing changed."; exit 1
+fi
+echo "NVIDIA driver branch: $DRV | bootloader: $LOADER"
+MISSING=()
+for l in "${LOCKS[@]}"; do zypper -q ll | awk -F'|' '{gsub(/ /,"",$2);print $2}' | grep -qxF "$l" || MISSING+=("$l"); done
+if [ ${#MISSING[@]} -gt 0 ]; then
+  if [ $CHECK = 1 ]; then PF=WARN; PFN="locks missing: ${MISSING[*]}"
+  else zypper -q al "${MISSING[@]}" >/dev/null && PFN="re-added missing locks: ${MISSING[*]}" || { set_st preflight FAILED "could not add locks"; PF=FAILED; }; fi
+fi
+echo "Locks: ${LOCKS[*]} ${MISSING:+(were missing: ${MISSING[*]})}"
+ROOTFREE=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
+echo "Free on /: ${ROOTFREE} GB"
+[ "$ROOTFREE" -ge 5 ] || { PF=FAILED; PFN="only ${ROOTFREE} GB free on / (need 5 GB) — free space first"; }
+if mountpoint -q /boot/efi; then
+  ESPFREE=$(df -BM --output=avail /boot/efi | tail -1 | tr -dc 0-9); echo "Free on EFI partition: ${ESPFREE} MB"
+  [ "$ESPFREE" -ge 150 ] || { [ $PF = FAILED ] || PF=WARN; PFN="$PFN; EFI partition only ${ESPFREE} MB free (remove old boot entries/kernels)"; }
+fi
+if [ $PF != FAILED ]; then
+  echo "Refreshing repositories..."
+  if ! zypper -n ref >/tmp/ue-ref.$$ 2>&1 && ! zypper -n ref >/tmp/ue-ref.$$ 2>&1; then
+    OSS=$(zypper -q lr -E -u | awk -F'|' 'NR>2{gsub(/ /,"",$2);gsub(/ /,"",$7);
+      if($7 ~ /opensuse\.org\/(tumbleweed\/repo\/oss|update\/tumbleweed)\/?$/) printf "-r %s ",$2}')
+    if zypper -n ref $OSS >/dev/null 2>&1; then
+      [ $PF = FAILED ] || PF=WARN
+      PFN="$PFN; some third-party repo failed to refresh (official openSUSE OK): $(grep -iE 'error|problem' /tmp/ue-ref.$$ | head -2 | tr '\n' ' ')"
+    else PF=FAILED; PFN="cannot reach official openSUSE repos (no internet?)"; fi
+  fi
+  rm -f /tmp/ue-ref.$$
+fi
+[ -n "${ST[preflight]:-}" ] || set_st preflight "$PF" "${PFN#; }"
+echo "Pre-flight: ${ST[preflight]} ${NOTE[preflight]}"
+
+if [ "${ST[preflight]}" = FAILED ]; then
+  for s in os kernel flatpak firmware health; do set_st $s SKIPPED "pre-flight failed"; done
+else
+# ---------- 1 OS + apps ----------
+hdr "1. OS + apps (zypper dup; kernel/NVIDIA stay locked)"
+SNAPLOCKED(){ rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' 'kernel-default*' 'nvidia-*' 'kernel-firmware-nvidia*' | sort; }
+BEFORE=$(SNAPLOCKED)
+DUP=(zypper -n --no-refresh dup --no-allow-vendor-change --auto-agree-with-licenses)
+DRY=$("${DUP[@]}" --dry-run 2>&1); rc=$?
+grep -E 'packages? to |going to be REMOVED|Overall download size|Nothing to do' <<<"$DRY"
+if [ $rc != 0 ] && [ $rc != 106 ]; then
+  echo "$DRY" | tail -25; set_st os FAILED "dry run failed (code $rc, conflict?) — nothing changed; see log"
+elif grep -q 'Nothing to do' <<<"$DRY"; then set_st os UP_TO_DATE
+elif [ $CHECK = 1 ]; then set_st os "UPDATES" "$(grep -E 'packages? to ' <<<"$DRY" | head -1)"
+else
+  grep -A30 'going to be REMOVED' <<<"$DRY" | sed '/^$/q'
+  for try in 1 2; do "${DUP[@]}"; rc=$?; [ $rc = 103 ] || break; echo "zypper updated itself, running again..."; done
+  case $rc in
+    0|102|106) set_st os UPDATED "$(grep -E 'packages? to ' <<<"$DRY" | head -1)";;
+    *) set_st os FAILED "zypper dup failed (code $rc). Undo: sudo snapper rollback (see snapper list), reboot";;
+  esac
+  SN=$(snapper --csvout list --columns number,description 2>/dev/null | tail -1); [ -n "$SN" ] && echo "Latest snapshot: $SN"
+fi
+[ "$BEFORE" = "$(SNAPLOCKED)" ] || set_st os FAILED "a locked kernel/NVIDIA package changed during dup! check: rpm -qa 'nvidia-*' 'kernel-default*'"
+echo "OS + apps: ${ST[os]} ${NOTE[os]}"
+
+# ---------- 2 kernel + NVIDIA ----------
+hdr "2. Kernel + NVIDIA (together, official openSUSE only)"
+if [ "${ST[os]}" = FAILED ]; then set_st kernel SKIPPED "OS step failed"
+else
+  "$SKU" --no-refresh $([ $CHECK = 1 ] && echo --check); rc=$?
+  case $rc in
+    0)  set_st kernel UP_TO_DATE;;
+    30) set_st kernel UPDATES "kernel + NVIDIA ready to install together";;
+    10) set_st kernel WAITING "new kernel or driver out, matching NVIDIA not published yet — kept current";;
+    20) set_st kernel UPDATED "reboot needed";;
+    *)  set_st kernel FAILED "see messages above";;
+  esac
+fi
+echo "Kernel + NVIDIA: ${ST[kernel]} ${NOTE[kernel]}"
+
+# ---------- 3 Flatpak ----------
+hdr "3. Flatpak apps"
+if ! command -v flatpak >/dev/null; then set_st flatpak "N/A" "flatpak not installed"
+else
+  SYS=$(flatpak remote-ls --system --updates 2>/dev/null | wc -l)
+  USR=0; [ -n "$U" ] && USR=$(sudo -u "$U" flatpak remote-ls --user --updates 2>/dev/null | wc -l)
+  echo "Updates: system $SYS, user $USR"
+  if [ $((SYS+USR)) = 0 ]; then set_st flatpak UP_TO_DATE
+  elif [ $CHECK = 1 ]; then set_st flatpak UPDATES "$((SYS+USR)) updates"
+  else
+    ok=1
+    [ "$SYS" = 0 ] || flatpak update --system -y --noninteractive || ok=0
+    [ "$USR" = 0 ] || sudo -u "$U" flatpak update --user -y --noninteractive || ok=0
+    [ $ok = 1 ] && set_st flatpak UPDATED "$((SYS+USR)) updated" || set_st flatpak FAILED "flatpak update failed"
+  fi
+fi
+echo "Flatpak: ${ST[flatpak]} ${NOTE[flatpak]}"
+
+# ---------- 4 firmware ----------
+hdr "4. Firmware (report only)"
+if ! command -v fwupdmgr >/dev/null; then set_st firmware "N/A" "fwupd not installed"
+else
+  fwupdmgr refresh --force --assume-yes >/dev/null 2>&1 || true
+  FW=$(fwupdmgr get-updates --no-unreported-check --assume-yes 2>&1); rc=$?
+  if [ $rc = 0 ]; then echo "$FW" | grep -vE '^\s*$' | head -30
+    set_st firmware AVAILABLE "firmware update found — review, then run: sudo fwupdmgr update"
+  elif grep -qi 'no updat' <<<"$FW"; then set_st firmware UP_TO_DATE
+  else echo "$FW" | tail -5; set_st firmware WARN "could not check firmware (fwupd code $rc)"; fi
+fi
+echo "Firmware: ${ST[firmware]} ${NOTE[firmware]}"
+
+# ---------- 5 health ----------
+hdr "5. Health check"
+H=OK; HN=()
+NK=$(rpm -q kernel-default --qf '%{VERSION}-%{RELEASE}\n' | sort -V | tail -1); NKR=${NK%.*}
+DV=""; for p in "nvidia-gl-$DRV" "nvidia-compute-$DRV"; do rpm -q "$p" >/dev/null 2>&1 && { DV=$(rpm -q --qf '%{VERSION}' "$p"); break; }; done
+MV=$(modinfo -k "$NKR-default" -F version nvidia 2>/dev/null)
+echo "Newest kernel $NKR | its NVIDIA module ${MV:-NONE} | NVIDIA userspace ${DV:-NONE}"
+[ -n "$MV" ] || { H=FAILED; HN+=("newest kernel $NKR has NO NVIDIA module — do NOT reboot into it"); }
+[ -z "$MV" ] || [ "$MV" = "$DV" ] || { H=FAILED; HN+=("module $MV != userspace $DV — do NOT reboot"); }
+case $LOADER in
+  systemd-boot|grub2-bls)
+    DEF=$(bootctl list --no-pager --json=short 2>/dev/null | python3 -c 'import json,sys
+print(next((e["id"] for e in json.load(sys.stdin) if e.get("isDefault")),""))' 2>/dev/null)
+    [ -n "$DEF" ] || DEF=$(bootctl status --no-pager 2>/dev/null | awk '/(Default|Preferred) Entry:/{print $3; exit}')
+    echo "Default boot entry: ${DEF:-unknown}"
+    if [ -z "$DEF" ]; then [ "$H" = FAILED ] || H=WARN; HN+=("could not read default boot entry")
+    elif ! grep -qF "$NKR-default" <<<"$DEF"; then H=FAILED; HN+=("default boot entry is not kernel $NKR — run: sudo bootctl set-default <entry for $NKR>"); fi;;
+  *)
+    if grep -qF "vmlinuz-$NKR-default" /boot/grub2/grub.cfg 2>/dev/null; then echo "GRUB menu has kernel $NKR"
+    else H=FAILED; HN+=("GRUB menu has no entry for $NKR — run: sudo grub2-mkconfig -o /boot/grub2/grub.cfg"); fi;;
+esac
+if lsmod | grep -q '^nvidia '; then echo "Running: kernel $(uname -r), NVIDIA loaded ($(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null))"
+else H=FAILED; HN+=("NVIDIA driver not loaded in the running system"); fi
+for l in "${LOCKS[@]}"; do zypper -q ll | awk -F'|' '{gsub(/ /,"",$2);print $2}' | grep -qxF "$l" || { H=FAILED; HN+=("lock $l missing"); }; done
+REBOOT=0
+zypper -q needs-rebooting >/dev/null 2>&1; [ $? = 102 ] && REBOOT=1
+[ "${ST[kernel]}" = UPDATED ] && REBOOT=1
+[ "$(uname -r)" = "$NKR-default" ] || REBOOT=1
+SVC=$(zypper -q ps -sss 2>/dev/null | sort -u | tr '\n' ' ')
+[ -n "$SVC" ] && echo "Services using old files (restart or reboot): $SVC"
+set_st health "$H" "$(IFS=';'; echo "${HN[*]:-}")"
+echo "Health: ${ST[health]} ${NOTE[health]}"
+fi
+
+# ---------- summary ----------
+hdr "SUMMARY"
+FAIL=0
+for s in "${ORDER[@]}"; do printf '  %-10s %-11s %s\n' "$s" "${ST[$s]:-?}" "${NOTE[$s]:-}"; [ "${ST[$s]:-}" = FAILED ] && FAIL=1; done
+echo "  time: $(( ($(date +%s)-T0)/60 ))m $(( ($(date +%s)-T0)%60 ))s   log: $LOG"
+echo
+if [ $FAIL = 1 ]; then echo "FAILED: see the step marked FAILED above (plain reason next to it). Do NOT reboot until it is fixed."; exit 1; fi
+[ "${REBOOT:-0}" = 1 ] && [ $CHECK = 0 ] && echo "REBOOT NEEDED to start the new kernel/driver/system libraries."
+[ $CHECK = 1 ] && echo "SUCCESS (check only): nothing was changed." || echo "SUCCESS: PC is up to date."
+exit 0
