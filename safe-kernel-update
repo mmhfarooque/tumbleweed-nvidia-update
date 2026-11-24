@@ -8,6 +8,7 @@
 # Usage: sudo safe-kernel-update [--check] [--no-refresh]
 # Exit:  0 up to date | 10 waiting (matching driver not published yet) | 20 updated, reboot needed
 #        30 --check: ready to update | 1 failed
+# Author: Mahmud Farooque — MIT License — https://github.com/mmhfarooque/tumbleweed-nvidia-update
 # Rollback if the new kernel misbehaves: sudo snapper rollback <PRE number printed below>, reboot.
 set -uo pipefail
 export LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

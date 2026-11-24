@@ -1,5 +1,7 @@
 # tumbleweed-nvidia-update
 
+[![Release](https://img.shields.io/github/v/release/mmhfarooque/tumbleweed-nvidia-update)](https://github.com/mmhfarooque/tumbleweed-nvidia-update/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **One safe command to update an openSUSE Tumbleweed PC that has an NVIDIA GPU.**
 
 On Tumbleweed a new kernel sometimes lands before the NVIDIA driver built for it.
@@ -49,6 +51,8 @@ cd tumbleweed-nvidia-update
 ./update-everything --check
 ```
 
+To install a fixed version, download it from [Releases](https://github.com/mmhfarooque/tumbleweed-nvidia-update/releases) or `git checkout v1.0.0`.
+
 The first run asks for your sudo password and copies `update-everything` and `safe-kernel-update` to
 `/usr/local/bin`. From then on just type `update-everything`. To pick up a new version, run `git pull`,
 then `./update-everything --check` once.
@@ -82,4 +86,8 @@ sudo zypper rl 'kernel-default*' 'nvidia-*' 'kernel-firmware-nvidia*'
 Use at your own risk. It's tested on Tumbleweed with an RTX 3060, the G07 driver and systemd-boot.
 GRUB and G06 paths follow the same logic but have had less testing. Issues and PRs welcome.
 
-License: MIT
+## Author
+
+Created by **Mahmud Farooque** ([@mmhfarooque](https://github.com/mmhfarooque)).
+
+License: MIT © 2026 Mahmud Farooque
