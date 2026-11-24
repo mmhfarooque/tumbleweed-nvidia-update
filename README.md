@@ -41,7 +41,14 @@ Logs are written to `/var/log/update-everything/`.
   `sudo zypper in nvidia-open-driver-G06-signed-kmp-meta` (or G07)
 - Bootloader: systemd-boot or grub2-bls (via `sdbootutil`), or classic GRUB 2
 
-Not supported: the proprietary closed `nvidia-driver-G0x-kmp` from NVIDIA's repo, and the `kernel-longterm` flavour.
+### Which GPUs?
+
+| GPU | Driver | Supported |
+|---|---|---|
+| RTX 20 / 30 / 40 / 50 series, GTX 16 series (Turing and newer) | openSUSE `nvidia-open-driver-G06/G07-signed-kmp` | ✅ Yes |
+| GTX 10 series and older (Pascal, Maxwell, Kepler) | proprietary `nvidia-driver-G0x-kmp` / G05 / G04 from NVIDIA's repo | ❌ No: the script stops with a message and changes nothing |
+
+Also not supported: the `kernel-longterm` flavour, and non-Tumbleweed releases (Leap, Slowroll).
 
 ## Install
 
@@ -83,8 +90,16 @@ sudo zypper rl 'kernel-default*' 'nvidia-*' 'kernel-firmware-nvidia*'
 
 ## Disclaimer
 
-Use at your own risk. It's tested on Tumbleweed with an RTX 3060, the G07 driver and systemd-boot.
-GRUB and G06 paths follow the same logic but have had less testing. Issues and PRs welcome.
+Use at your own risk. `--check` never changes anything, so try that first.
+
+| Path | Status |
+|---|---|
+| RTX 3060 · G07 620.70.06 · systemd-boot · `--check` and full run (everything up to date) | ✅ tested |
+| Real kernel + driver update through v1.x of the script | ⏳ waiting for the next kernel release (the same logic was used by hand on 23 Nov 2026 for 7.3.5) |
+| G06 driver | ⚠️ same logic, untested |
+| Classic GRUB 2 | ⚠️ same logic, untested |
+
+Tested a different setup? Please open an issue or PR with your result.
 
 ## Author
 

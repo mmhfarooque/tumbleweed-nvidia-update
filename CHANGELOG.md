@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.0.1 — 2026-11-24
+- README: supported GPU table (Turing+ yes, Pascal and older no) and tested/untested status table.
+
 ## v1.0.0 — 2026-11-24
 First release by Mahmud Farooque.
 - `update-everything`: OS + apps (zypper dup), kernel + NVIDIA together, Flatpak, firmware report, health check; `--check` mode.
